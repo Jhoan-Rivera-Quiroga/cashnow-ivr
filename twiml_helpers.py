@@ -50,6 +50,8 @@ def gather_response(
         speech_timeout="auto",
         language=v["gather_lang"],
         action_on_empty_result=True,
+        enhanced=True,
+        speech_model="phone_call",
     )
     if num_digits:
         gather_kwargs["num_digits"] = num_digits
