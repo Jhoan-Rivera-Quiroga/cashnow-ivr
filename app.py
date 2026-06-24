@@ -1,168 +1,56 @@
 """
-Cash Now Test Strips - Inbound Call IVR
+Cash Now Test Strips - Vapi Tool Webhook Server
 
-Flask app exposing the Twilio Voice webhooks for (602) 800-9040:
+Vapi AI now handles the voice layer: answering calls, speech-to-text,
+talking to Claude, and text-to-speech. This Flask app only handles the
+tool-call webhooks that Claude triggers mid-conversation — saving pickup
+info, creating Detrack jobs, sending SMS messages.
 
-  POST /voice            - entry point, plays the main menu
-  POST /menu             - routes the caller's menu choice
-  POST /converse         - multi-turn Claude conversation (pickup or webhelp)
-  POST /transfer         - Option 3: live rep transfer (business-hours aware)
-  POST /transfer-status  - <Dial> action callback (rep didn't answer, etc.)
-  GET  /health           - simple health check for the hosting platform
-
-See README.md for Twilio configuration and deployment instructions.
+Routes:
+  POST /vapi/tools  - Vapi sends tool calls here; we execute and respond
+  GET  /health      - health check for Render / UptimeRobot
 """
 
+import json
 import logging
-from functools import wraps
+import threading
 
-from flask import Flask, request, abort
-from twilio.request_validator import RequestValidator
-from twilio.twiml.voice_response import VoiceResponse
+from flask import Flask, request, jsonify
 
-import claude_agent
 import config
+import detrack_client
 import hours
-import twiml_helpers
-from session_store import get_session, save_session, clear_session
+import sms_client
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-
 # ---------------------------------------------------------------------------
-# Twilio request signature validation
-# ---------------------------------------------------------------------------
-
-def validate_twilio_request(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if not config.TWILIO_VALIDATE_SIGNATURE:
-            return f(*args, **kwargs)
-
-        validator = RequestValidator(config.TWILIO_AUTH_TOKEN)
-        signature = request.headers.get("X-Twilio-Signature", "")
-        url = request.url
-        # Most hosting platforms terminate TLS at a proxy and forward to
-        # Flask over plain HTTP - reconstruct the public HTTPS URL so the
-        # signature (computed by Twilio against the HTTPS URL) matches.
-        if request.headers.get("X-Forwarded-Proto", "").lower() == "https" and url.startswith("http://"):
-            url = "https://" + url[len("http://"):]
-
-        if not validator.validate(url, request.form, signature):
-            logger.warning("Invalid Twilio signature for %s", url)
-            abort(403)
-        return f(*args, **kwargs)
-
-    return decorated
-
-
-# ---------------------------------------------------------------------------
-# Menu copy (English / Spanish)
+# Per-call session store
+# Tracks pickup info collected across multiple tool calls within one call.
+# Keyed by Vapi call ID. Cleared when the order is finalized or call ends.
 # ---------------------------------------------------------------------------
 
-MENU_HINTS = (
-    "schedule a pickup, sell my test strips, sell diabetic supplies, "
-    "website, order online, representative, agent, espanol, spanish"
-)
-
-MENU_TEXT = {
-    "en": (
-        "Thanks for calling Cash Now Test Strips! If you have diabetic "
-        "supplies to sell and would like to schedule a pickup, press 1, or "
-        "just tell me. For help ordering on our website, press 2. To speak "
-        "with a representative, press 3. Para espanol, oprima 9."
-    ),
-    "es": (
-        "Gracias por llamar a Cash Now Test Strips. Si tiene articulos "
-        "diabeticos para vender y quiere agendar una recogida, oprima 1 o "
-        "digamelo. Para ayuda con su pedido en el sitio web, oprima 2. Para "
-        "hablar con un representante, oprima 3."
-    ),
-}
-
-RETRY_PREFIX = {
-    "en": "Sorry, I didn't catch that. ",
-    "es": "Lo siento, no le entendi. ",
-}
-
-KICKOFF_PICKUP = {
-    "en": (
-        "(The caller chose to schedule a pickup to sell diabetic supplies. "
-        "Greet them briefly in one short sentence and ask for their full "
-        "name to begin.)"
-    ),
-    "es": (
-        "(El cliente eligio agendar una recogida para vender articulos "
-        "diabeticos. Saludelo brevemente en una oracion corta y pidale su "
-        "nombre completo para comenzar.)"
-    ),
-}
-
-KICKOFF_WEBHELP = {
-    "en": (
-        "(The caller chose to get help ordering on the website. Greet them "
-        "briefly in one short sentence and start guiding them through step "
-        "1.)"
-    ),
-    "es": (
-        "(El cliente eligio recibir ayuda para hacer su pedido en el sitio "
-        "web. Saludelo brevemente en una oracion corta y empiece a guiarlo "
-        "con el primer paso.)"
-    ),
-}
-
-PICKUP_KEYWORDS = [
-    "sell", "pickup", "pick up", "schedule", "appointment", "buy", "cash",
-    "vender", "recoger", "recogida", "cita", "venta", "comprar",
-]
-WEBHELP_KEYWORDS = [
-    "website", "online", "web", "order online", "site", "internet",
-    "pagina", "sitio",
-]
-TRANSFER_KEYWORDS = [
-    "representative", "agent", "human", "person", "operator", "someone",
-    "representante", "persona", "agente", "alguien", "operador",
-]
-SPANISH_KEYWORDS = ["espanol", "español", "spanish"]
+_sessions: dict = {}
+_sessions_lock = threading.Lock()
 
 
-def _classify_menu_choice(digits: str, speech: str):
-    speech_l = speech.lower()
-    if digits == "9" or any(k in speech_l for k in SPANISH_KEYWORDS):
-        return "spanish"
-    if digits == "1" or any(k in speech_l for k in PICKUP_KEYWORDS):
-        return "pickup"
-    if digits == "2" or any(k in speech_l for k in WEBHELP_KEYWORDS):
-        return "webhelp"
-    if digits == "3" or any(k in speech_l for k in TRANSFER_KEYWORDS):
-        return "transfer"
-    return None
+def _get_session(call_id: str) -> dict:
+    with _sessions_lock:
+        if call_id not in _sessions:
+            _sessions[call_id] = {
+                "collected": {},
+                "items": [],
+                "language": "en",
+            }
+        return _sessions[call_id]
 
 
-def _menu_gather(session: dict, retry: bool = False):
-    language = session.get("language", "en")
-    text = MENU_TEXT[language]
-    if retry:
-        text = RETRY_PREFIX[language] + text
-    return twiml_helpers.gather_response(text, "/menu", language, hints=MENU_HINTS, num_digits=1, timeout=6)
-
-
-def _respond_from_flags(reply_text: str, flags: dict, session: dict, call_sid: str):
-    language = session.get("language", "en")
-
-    if flags.get("transfer_requested"):
-        save_session(call_sid, session)
-        return str(twiml_helpers.say_and_redirect(reply_text, "/transfer", language))
-
-    if flags.get("end_call"):
-        clear_session(call_sid)
-        return str(twiml_helpers.say_and_hangup(reply_text, language))
-
-    save_session(call_sid, session)
-    return str(twiml_helpers.gather_response(reply_text, "/converse", language, timeout=8))
+def _clear_session(call_id: str):
+    with _sessions_lock:
+        _sessions.pop(call_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -174,145 +62,123 @@ def health():
     return {"status": "ok"}
 
 
-@app.route("/voice", methods=["POST"])
-@validate_twilio_request
-def voice():
-    call_sid = request.form["CallSid"]
-    clear_session(call_sid)  # fresh state for every new call
-    session = get_session(call_sid)
-    save_session(call_sid, session)
-    return str(_menu_gather(session))
+@app.route("/vapi/tools", methods=["POST"])
+def vapi_tools():
+    """
+    Vapi posts here whenever Claude calls a tool during a conversation.
+    Supported message types:
+      - tool-calls        : Claude called one or more tools; we run them
+      - end-of-call-report: call finished; we clean up the session
+    """
+    body = request.get_json(force=True) or {}
+    message = body.get("message", {})
+    msg_type = message.get("type", "")
+
+    call_info = message.get("call", {})
+    call_id = call_info.get("id", "unknown")
+    caller_number = call_info.get("customer", {}).get("number", "")
+
+    if msg_type == "end-of-call-report":
+        _clear_session(call_id)
+        logger.info("Call %s ended — session cleared.", call_id)
+        return jsonify({}), 200
+
+    if msg_type != "tool-calls":
+        return jsonify({}), 200
+
+    session = _get_session(call_id)
+    tool_calls = message.get("toolCallList", [])
+    results = []
+
+    for tc in tool_calls:
+        tool_call_id = tc.get("id")
+        fn = tc.get("function", {})
+        name = fn.get("name", "")
+        try:
+            args = json.loads(fn.get("arguments", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            args = {}
+
+        logger.info("Tool call: %s | args: %s | call: %s", name, args, call_id)
+        result = _execute_tool(name, args, session, call_id, caller_number)
+        results.append({"toolCallId": tool_call_id, "result": result})
+
+    return jsonify({"results": results})
 
 
-@app.route("/menu", methods=["POST"])
-@validate_twilio_request
-def menu():
-    call_sid = request.form["CallSid"]
-    from_number = request.form.get("From", "")
-    digits = request.form.get("Digits", "")
-    speech = request.form.get("SpeechResult", "")
+# ---------------------------------------------------------------------------
+# Tool execution
+# ---------------------------------------------------------------------------
 
-    session = get_session(call_sid)
-    choice = _classify_menu_choice(digits, speech)
+def _execute_tool(
+    name: str, args: dict, session: dict, call_id: str, caller_number: str
+) -> str:
 
-    if choice == "spanish":
-        session["language"] = "es"
-        save_session(call_sid, session)
-        return str(_menu_gather(session))
+    if name == "update_pickup_info":
+        collected = session["collected"]
+        for key in (
+            "full_name", "phone", "address", "pickup_date",
+            "pickup_window", "photo_provided", "extra_notes",
+        ):
+            if key in args:
+                collected[key] = args[key]
+        if "items" in args:
+            session["items"] = args["items"]
+        logger.info("Pickup info updated for call %s: %s", call_id, collected)
+        return "Saved."
 
-    if choice == "pickup":
-        session["flow"] = "pickup"
-        kickoff = KICKOFF_PICKUP[session.get("language", "en")]
-        reply_text, flags = claude_agent.converse(session, kickoff, call_sid, from_number)
-        return _respond_from_flags(reply_text, flags, session, call_sid)
-
-    if choice == "webhelp":
-        session["flow"] = "webhelp"
-        kickoff = KICKOFF_WEBHELP[session.get("language", "en")]
-        reply_text, flags = claude_agent.converse(session, kickoff, call_sid, from_number)
-        return _respond_from_flags(reply_text, flags, session, call_sid)
-
-    if choice == "transfer":
-        save_session(call_sid, session)
-        return str(twiml_helpers.say_and_redirect("", "/transfer", session.get("language", "en")))
-
-    # Unclear input - retry once, then fall back to a live transfer
-    session["menu_retries"] = session.get("menu_retries", 0) + 1
-    if session["menu_retries"] >= 2:
-        save_session(call_sid, session)
-        return str(twiml_helpers.say_and_redirect("", "/transfer", session.get("language", "en")))
-
-    save_session(call_sid, session)
-    return str(_menu_gather(session, retry=True))
-
-
-@app.route("/converse", methods=["POST"])
-@validate_twilio_request
-def converse():
-    call_sid = request.form["CallSid"]
-    from_number = request.form.get("From", "")
-    digits = request.form.get("Digits", "")
-    speech = request.form.get("SpeechResult", "")
-
-    session = get_session(call_sid)
-    language = session.get("language", "en")
-
-    user_text = speech or (f"(caller pressed {digits} on the keypad)" if digits else "")
-
-    if not user_text:
-        session["empty_count"] = session.get("empty_count", 0) + 1
-        if session["empty_count"] >= 2:
-            save_session(call_sid, session)
-            text = (
-                "I'm having trouble hearing you. Let me connect you with a representative."
-                if language == "en"
-                else "Tengo problemas para escucharle. Le voy a comunicar con un representante."
+    elif name == "finalize_pickup":
+        collected = session["collected"]
+        order = {
+            "name": collected.get("full_name", "not provided"),
+            "phone": collected.get("phone") or caller_number,
+            "address": collected.get("address", "not provided"),
+            "pickup_date": collected.get("pickup_date", "not provided"),
+            "pickup_window": collected.get("pickup_window", "not provided"),
+            "items": session.get("items", []),
+            "photo_provided": collected.get("photo_provided", False),
+            "extra_notes": collected.get("extra_notes", ""),
+            "language": session.get("language", "en"),
+            "call_sid": call_id,
+        }
+        result = detrack_client.create_draft_collection(order)
+        if not result.get("ok"):
+            logger.error(
+                "Detrack draft failed for call %s: %s",
+                call_id, result.get("error"),
             )
-            return str(twiml_helpers.say_and_redirect(text, "/transfer", language))
-
-        save_session(call_sid, session)
-        retry_text = RETRY_PREFIX[language] + (
-            "Could you say that again?" if language == "en" else "Puede repetirlo?"
-        )
-        return str(twiml_helpers.gather_response(retry_text, "/converse", language, timeout=8))
-
-    session["empty_count"] = 0
-    reply_text, flags = claude_agent.converse(session, user_text, call_sid, from_number)
-    return _respond_from_flags(reply_text, flags, session, call_sid)
-
-
-@app.route("/transfer", methods=["POST"])
-@validate_twilio_request
-def transfer():
-    call_sid = request.form["CallSid"]
-    session = get_session(call_sid)
-    language = session.get("language", "en")
-
-    if hours.is_open() and config.REP_PHONE_NUMBER:
-        say_text = (
-            "One moment, connecting you with a representative."
-            if language == "en"
-            else "Un momento, le voy a comunicar con un representante."
-        )
-        save_session(call_sid, session)
-        return str(
-            twiml_helpers.dial_representative(
-                say_text, config.REP_PHONE_NUMBER, config.REP_DIAL_TIMEOUT, "/transfer-status", language
+            sms_client.alert_dispatch_failure(
+                order, result.get("error", "unknown error")
             )
+        _clear_session(call_id)
+        return (
+            "Draft order created successfully."
+            if result.get("ok")
+            else "Order saved locally; Detrack sync failed."
         )
 
-    offer_text = {
-        "en": " I can still help you schedule a pickup for your items, or help you order on our website right now. Press 1 to schedule a pickup, or press 2 for website help.",
-        "es": " Aun le puedo ayudar a agendar una recogida para sus articulos, o ayudarle con su pedido en el sitio web ahora mismo. Oprima 1 para agendar una recogida, o oprima 2 para ayuda con el sitio web.",
-    }
-    msg = hours.hours_message(language) + offer_text[language]
-    save_session(call_sid, session)
-    return str(twiml_helpers.gather_response(msg, "/menu", language, hints=MENU_HINTS, num_digits=1, timeout=8))
+    elif name == "set_language":
+        lang = args.get("language", "en")
+        if lang in ("en", "es"):
+            session["language"] = lang
+        return f"Language set to {lang}."
 
+    elif name == "send_website_link":
+        phone = args.get("phone") or caller_number
+        ok = sms_client.send_pickup_form_link(phone, session.get("language", "en"))
+        return "Link sent." if ok else "Failed to send link."
 
-@app.route("/transfer-status", methods=["POST"])
-@validate_twilio_request
-def transfer_status():
-    call_sid = request.form["CallSid"]
-    session = get_session(call_sid)
-    language = session.get("language", "en")
-    status = request.form.get("DialCallStatus", "")
+    elif name == "switch_to_pickup_flow":
+        return "Switched to pickup flow."
 
-    if status == "completed":
-        clear_session(call_sid)
-        return str(VoiceResponse())
+    elif name == "check_business_hours":
+        is_open = hours.is_open()
+        msg = hours.hours_message(session.get("language", "en"))
+        return f"{'Open' if is_open else 'Closed'}. {msg}"
 
-    apology = {
-        "en": "Sorry, no one is available right now.",
-        "es": "Lo siento, no hay nadie disponible en este momento.",
-    }
-    offer_text = {
-        "en": " I can help you schedule a pickup for your items, or help you order on our website. Press 1 to schedule a pickup, or press 2 for website help.",
-        "es": " Le puedo ayudar a agendar una recogida para sus articulos, o ayudarle con su pedido en el sitio web. Oprima 1 para agendar una recogida, o oprima 2 para ayuda con el sitio web.",
-    }
-    msg = apology[language] + offer_text[language]
-    save_session(call_sid, session)
-    return str(twiml_helpers.gather_response(msg, "/menu", language, hints=MENU_HINTS, num_digits=1, timeout=8))
+    else:
+        logger.warning("Unknown tool called: %s", name)
+        return f"Unknown tool: {name}"
 
 
 if __name__ == "__main__":
