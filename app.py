@@ -1,14 +1,15 @@
 """
-Cash Now Test Strips - Vapi Tool Webhook Server
+Cash Now Test Strips - Retell Tool Webhook Server
 
-Vapi AI now handles the voice layer: answering calls, speech-to-text,
+Retell AI handles the voice layer: answering calls, speech-to-text,
 talking to Claude, and text-to-speech. This Flask app only handles the
 tool-call webhooks that Claude triggers mid-conversation — saving pickup
 info, creating Detrack jobs, sending SMS messages.
 
 Routes:
-  POST /vapi/tools  - Vapi sends tool calls here; we execute and respond
-  GET  /health      - health check for Render / UptimeRobot
+  POST /retell/tools    - Retell sends one tool call here per request
+  POST /retell/webhook  - Retell call lifecycle events (call_ended, etc.)
+  GET  /health          - health check for Render / UptimeRobot
 """
 
 import json
@@ -30,7 +31,7 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 # Per-call session store
 # Tracks pickup info collected across multiple tool calls within one call.
-# Keyed by Vapi call ID. Cleared when the order is finalized or call ends.
+# Keyed by Retell call ID. Cleared when the order is finalized or call ends.
 # ---------------------------------------------------------------------------
 
 _sessions: dict = {}
@@ -62,48 +63,49 @@ def health():
     return {"status": "ok"}
 
 
-@app.route("/vapi/tools", methods=["POST"])
-def vapi_tools():
+@app.route("/retell/tools", methods=["POST"])
+def retell_tools():
     """
-    Vapi posts here whenever Claude calls a tool during a conversation.
-    Supported message types:
-      - tool-calls        : Claude called one or more tools; we run them
-      - end-of-call-report: call finished; we clean up the session
+    Retell posts here when Claude calls a tool.
+    One tool call per request; respond with {"result": "..."}
     """
     body = request.get_json(force=True) or {}
-    message = body.get("message", {})
-    msg_type = message.get("type", "")
 
-    call_info = message.get("call", {})
-    call_id = call_info.get("id", "unknown")
-    caller_number = call_info.get("customer", {}).get("number", "")
+    call_info = body.get("call", {})
+    call_id = call_info.get("call_id", "unknown")
+    caller_number = call_info.get("from_number", "")
 
-    if msg_type == "end-of-call-report":
-        _clear_session(call_id)
-        logger.info("Call %s ended — session cleared.", call_id)
-        return jsonify({}), 200
-
-    if msg_type != "tool-calls":
-        return jsonify({}), 200
-
-    session = _get_session(call_id)
-    tool_calls = message.get("toolCallList", [])
-    results = []
-
-    for tc in tool_calls:
-        tool_call_id = tc.get("id")
-        fn = tc.get("function", {})
-        name = fn.get("name", "")
+    tool_name = body.get("name", "")
+    args = body.get("arguments", {})
+    if isinstance(args, str):
         try:
-            args = json.loads(fn.get("arguments", "{}"))
+            args = json.loads(args)
         except (json.JSONDecodeError, TypeError):
             args = {}
 
-        logger.info("Tool call: %s | args: %s | call: %s", name, args, call_id)
-        result = _execute_tool(name, args, session, call_id, caller_number)
-        results.append({"toolCallId": tool_call_id, "result": result})
+    logger.info("Tool call: %s | args: %s | call: %s", tool_name, args, call_id)
+    session = _get_session(call_id)
+    result = _execute_tool(tool_name, args, session, call_id, caller_number)
 
-    return jsonify({"results": results})
+    return jsonify({"result": result})
+
+
+@app.route("/retell/webhook", methods=["POST"])
+def retell_webhook():
+    """
+    Retell general webhook for call lifecycle events.
+    Used to clear the session when a call ends.
+    """
+    body = request.get_json(force=True) or {}
+    event = body.get("event", "")
+
+    if event == "call_ended":
+        call_id = body.get("call", {}).get("call_id", "")
+        if call_id:
+            _clear_session(call_id)
+            logger.info("Call %s ended — session cleared.", call_id)
+
+    return jsonify({}), 200
 
 
 # ---------------------------------------------------------------------------
