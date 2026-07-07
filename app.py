@@ -135,11 +135,11 @@ def _execute_tool(
     elif name == "finalize_pickup":
         collected = session["collected"]
         order = {
-            "name": collected.get("full_name", "not provided"),
+            "name": collected.get("full_name", ""),
             "phone": collected.get("phone") or caller_number,
-            "address": collected.get("address", "not provided"),
-            "pickup_date": collected.get("pickup_date", "not provided"),
-            "pickup_window": collected.get("pickup_window", "not provided"),
+            "address": collected.get("address", ""),
+            "pickup_date": collected.get("pickup_date", ""),
+            "pickup_window": collected.get("pickup_window", ""),
             "items": session.get("items", []),
             "photo_provided": collected.get("photo_provided", False),
             "extra_notes": collected.get("extra_notes", ""),

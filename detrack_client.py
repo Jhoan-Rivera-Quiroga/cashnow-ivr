@@ -86,11 +86,19 @@ def _build_payload(order: dict) -> dict:
     if order.get("extra_notes"):
         notes_lines.append(f"Additional notes from caller: {order['extra_notes']}")
 
+    _raw_date = (order.get("pickup_date") or "").strip()
+    try:
+        _parsed = datetime.strptime(_raw_date, "%Y-%m-%d")
+        _age_days = (datetime.now() - _parsed).days
+        _date = _raw_date if _age_days <= 365 else datetime.now().strftime("%Y-%m-%d")
+    except ValueError:
+        _date = datetime.now().strftime("%Y-%m-%d")
+
     payload = {
         "data": {
             "type": "Collection",
             "do_number": f"CN-{int(time.time())}",
-            "date": order.get("pickup_date") or datetime.now().strftime("%Y-%m-%d"),
+            "date": _date,
             "deliver_to_collect_from": order.get("name", ""),
             "phone_number": order.get("phone", ""),
             "address": order.get("address", ""),
