@@ -94,11 +94,10 @@ def _build_payload(order: dict) -> dict:
             "deliver_to_collect_from": order.get("name", ""),
             "phone_number": order.get("phone", ""),
             "address": order.get("address", ""),
-            "notes": "\n".join(notes_lines),
+            "instructions": "\n".join(notes_lines),
+            "payment_mode": "cash",
             "items": items,
-            # info_recv = "information received" - a holding status that keeps
-            # this job out of dispatch until a human reviews/assigns it.
-            "status": "info_recv",
+            "status": "dispatched",
         }
     }
     return payload
