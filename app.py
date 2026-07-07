@@ -75,6 +75,9 @@ def retell_tools():
     call_id = call_info.get("call_id", "unknown")
     caller_number = call_info.get("from_number", "")
 
+    logger.info("Retell raw body keys: %s", list(body.keys()))
+    logger.info("Retell raw body: %s", body)
+
     tool_name = body.get("name", "")
     args = body.get("arguments", {})
     if isinstance(args, str):
