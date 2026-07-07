@@ -97,7 +97,9 @@ def _build_payload(order: dict) -> dict:
             "instructions": "\n".join(notes_lines),
             "payment_mode": "cash",
             "items": items,
-            "status": "dispatched",
+            # info_recv = "information received" - keeps the job off the driver
+            # app until a human dispatcher reviews and assigns it.
+            "status": "info_recv",
         }
     }
     return payload
