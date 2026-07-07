@@ -79,7 +79,7 @@ def retell_tools():
     logger.info("Retell raw body: %s", body)
 
     tool_name = body.get("name", "")
-    args = body.get("arguments", {})
+    args = body.get("args") or body.get("arguments") or {}
     if isinstance(args, str):
         try:
             args = json.loads(args)
