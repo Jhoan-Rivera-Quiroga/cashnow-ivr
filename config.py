@@ -77,6 +77,14 @@ SUPPORT_EMAIL = os.environ.get("SUPPORT_EMAIL", "support@cashnowteststrips.com")
 DISPATCH_ALERT_PHONE = os.environ.get("DISPATCH_ALERT_PHONE", "")
 
 # ---------------------------------------------------------------------------
+# Discord
+# ---------------------------------------------------------------------------
+# Webhook URL for the channel that receives caller escalation alerts.
+# Override via DISCORD_WEBHOOK_URL env var in Render (recommended — keep this
+# URL out of git history once you have it set in Render).
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+
+# ---------------------------------------------------------------------------
 # Session storage
 # ---------------------------------------------------------------------------
 # Optional. If set, sessions are stored in Redis (recommended for production

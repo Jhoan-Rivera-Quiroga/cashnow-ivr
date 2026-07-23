@@ -20,6 +20,7 @@ from flask import Flask, request, jsonify
 
 import config
 import detrack_client
+import discord_client
 import hours
 import sms_client
 
@@ -172,6 +173,16 @@ def _execute_tool(
 
     elif name == "switch_to_pickup_flow":
         return "Switched to pickup flow."
+
+    elif name == "escalate_to_rep":
+        caller_request = args.get("caller_request", "")
+        ok = discord_client.send_escalation(caller_number, caller_request)
+        if not ok:
+            logger.error(
+                "Discord escalation failed for call %s — request: %s",
+                call_id, caller_request,
+            )
+        return "Escalated." if ok else "Escalation recorded; team will follow up."
 
     elif name == "check_business_hours":
         is_open = hours.is_open()
